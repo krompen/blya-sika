@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 TOKEN = "8788493131:AAHEW8w-57mb1o_ogMMlWBl_QzJI62VG4FQ"
 ADMIN_ID = 8032626504
 ADMIN_USERNAME = "ciwige"
+CHANNEL_LINK = "https://t.me/Ciwige_search"
 DB_NAME = "tags.db"
 
 # ========== БАЗА ДАННЫХ ==========
