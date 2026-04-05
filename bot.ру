@@ -2,8 +2,8 @@ import sqlite3
 import datetime
 import random
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler
 
 # ========== КОНФИГ ==========
 TOKEN = "8622821774:AAHBL7d8Xxwhf1zfqcNCds8Y9H5-3TvOJBQ"
