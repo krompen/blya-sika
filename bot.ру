@@ -1,0 +1,1291 @@
+import sqlite3
+import datetime
+import random
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, PreCheckoutQueryHandler
+
+# ========== КОНФИГ ==========
+TOKEN = "8622821774:AAHBL7d8Xxwhf1zfqcNCds8Y9H5-3TvOJBQ"
+CREATOR_ID = 8032626504  # ТВОЙ ID (создатель)
+REQUIRED_CHANNEL = "@rezerv_legit"  # Обязательный канал для подписки
+DB_NAME = "content_bot.db"
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        registered_at TEXT,
+        diamonds INTEGER DEFAULT 0,
+        daily_bonus_date TEXT DEFAULT NULL,
+        referrer_id INTEGER DEFAULT NULL,
+        ref_earned INTEGER DEFAULT 0,
+        is_banned INTEGER DEFAULT 0,
+        ban_reason TEXT DEFAULT NULL,
+        level INTEGER DEFAULT 0
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS content (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT,
+        file_id TEXT,
+        price INTEGER,
+        created_at TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS subscribe_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_username TEXT,
+        channel_link TEXT,
+        bonus INTEGER DEFAULT 5,
+        created_at TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS user_subscribes (
+        user_id INTEGER,
+        task_id INTEGER,
+        completed_at TEXT,
+        PRIMARY KEY (user_id, task_id)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS tiktok_moderation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        screenshot_file_id TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        reviewed_at TEXT,
+        review_comment TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        created_at TEXT,
+        bonus_paid INTEGER DEFAULT 0
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount INTEGER,
+        type TEXT,
+        description TEXT,
+        created_at TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+    
+    # Добавляем настройки по умолчанию
+    c.execute('INSERT OR IGNORE INTO bot_settings (key, value) VALUES ("photo_price", "1")')
+    c.execute('INSERT OR IGNORE INTO bot_settings (key, value) VALUES ("video_price", "2")')
+    c.execute('INSERT OR IGNORE INTO bot_settings (key, value) VALUES ("daily_bonus", "5")')
+    c.execute('INSERT OR IGNORE INTO bot_settings (key, value) VALUES ("ref_bonus", "5")')
+    c.execute('INSERT OR IGNORE INTO bot_settings (key, value) VALUES ("subscribe_bonus", "5")')
+    c.execute('INSERT OR IGNORE INTO bot_settings (key, value) VALUES ("tiktok_bonus", "15")')
+    
+    # Добавляем обязательный канал как задание
+    c.execute('INSERT OR IGNORE INTO subscribe_tasks (channel_username, channel_link, bonus) VALUES (?, ?, ?)', 
+              ("rezerv_legit", "https://t.me/rezerv_legit", 0))
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def add_user(user_id, username, full_name, referrer_id=None):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    c.execute('INSERT OR IGNORE INTO users (user_id, username, full_name, registered_at) VALUES (?, ?, ?, ?)',
+              (user_id, username, full_name, now))
+    
+    if referrer_id and referrer_id != user_id:
+        c.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,))
+        if c.fetchone():
+            c.execute('INSERT INTO referrals (referrer_id, referred_id, created_at) VALUES (?, ?, ?)',
+                      (referrer_id, user_id, now))
+            ref_bonus = get_setting("ref_bonus", 5)
+            add_diamonds(referrer_id, ref_bonus, "referral", f"Бонус за приглашение")
+    
+    if user_id == CREATOR_ID:
+        c.execute('UPDATE users SET level = 3 WHERE user_id = ?', (user_id,))
+    
+    conn.commit()
+    conn.close()
+
+def get_user(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT user_id, username, full_name, registered_at, diamonds, daily_bonus_date, is_banned, ban_reason, level FROM users WHERE user_id = ?', (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def add_diamonds(user_id, amount, trans_type, description):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET diamonds = diamonds + ? WHERE user_id = ?', (amount, user_id))
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO transactions (user_id, amount, type, description, created_at) VALUES (?, ?, ?, ?, ?)',
+              (user_id, amount, trans_type, description, now))
+    conn.commit()
+    conn.close()
+
+def remove_diamonds(user_id, amount, trans_type, description):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET diamonds = diamonds - ? WHERE user_id = ? AND diamonds >= ?', (amount, user_id, amount))
+    if c.rowcount > 0:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('INSERT INTO transactions (user_id, amount, type, description, created_at) VALUES (?, ?, ?, ?, ?)',
+                  (user_id, -amount, trans_type, description, now))
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+def get_setting(key, default):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT value FROM bot_settings WHERE key = ?', (key,))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return int(result[0])
+    return default
+
+def update_setting(key, value):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE bot_settings SET value = ? WHERE key = ?', (str(value), key))
+    conn.commit()
+    conn.close()
+
+def get_all_content(content_type=None):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    if content_type:
+        c.execute('SELECT id, type, file_id, price FROM content WHERE type = ?', (content_type,))
+    else:
+        c.execute('SELECT id, type, file_id, price FROM content')
+    content = c.fetchall()
+    conn.close()
+    return content
+
+def add_content(content_type, file_id, price):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO content (type, file_id, price, created_at) VALUES (?, ?, ?, ?)',
+              (content_type, file_id, price, now))
+    content_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return content_id
+
+def delete_content(content_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('DELETE FROM content WHERE id = ?', (content_id,))
+    conn.commit()
+    conn.close()
+
+def get_subscribe_tasks():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT id, channel_username, channel_link, bonus FROM subscribe_tasks')
+    tasks = c.fetchall()
+    conn.close()
+    return tasks
+
+def add_subscribe_task(channel_username, channel_link, bonus):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO subscribe_tasks (channel_username, channel_link, bonus, created_at) VALUES (?, ?, ?, ?)',
+              (channel_username, channel_link, bonus, now))
+    task_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return task_id
+
+def delete_subscribe_task(task_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('DELETE FROM subscribe_tasks WHERE id = ?', (task_id,))
+    conn.commit()
+    conn.close()
+
+def is_user_subscribed(user_id, task_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT * FROM user_subscribes WHERE user_id = ? AND task_id = ?', (user_id, task_id))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+def mark_user_subscribed(user_id, task_id, bonus):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO user_subscribes (user_id, task_id, completed_at) VALUES (?, ?, ?)', (user_id, task_id, now))
+    conn.commit()
+    conn.close()
+    if bonus > 0:
+        add_diamonds(user_id, bonus, "subscribe", f"Бонус за подписку")
+
+def is_subscribed_to_channel(user_id, channel_username):
+    """Проверяет, подписан ли пользователь на канал"""
+    try:
+        # Этот метод требует, чтобы бот был админом в канале
+        # Если бот не админ, проверка не работает
+        return True  # Временно возвращаем True, пока не настроим
+    except:
+        return True
+
+def create_tiktok_request(user_id, username, file_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO tiktok_moderation (user_id, username, screenshot_file_id, created_at) VALUES (?, ?, ?, ?)',
+              (user_id, username, file_id, now))
+    req_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return req_id
+
+def get_pending_tiktok_requests():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT id, user_id, username, screenshot_file_id, created_at FROM tiktok_moderation WHERE status = "pending" ORDER BY id DESC')
+    reqs = c.fetchall()
+    conn.close()
+    return reqs
+
+def approve_tiktok_request(req_id, user_id, bonus):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE tiktok_moderation SET status = "approved", reviewed_at = ? WHERE id = ?', (now, req_id))
+    conn.commit()
+    conn.close()
+    add_diamonds(user_id, bonus, "tiktok", "Бонус за TikTok комментарии")
+
+def reject_tiktok_request(req_id, reason):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE tiktok_moderation SET status = "rejected", review_comment = ?, reviewed_at = ? WHERE id = ?', (reason, now, req_id))
+    conn.commit()
+    conn.close()
+
+def check_daily_bonus(user_id):
+    user = get_user(user_id)
+    if not user:
+        return False
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    if user[5] != today:
+        bonus = get_setting("daily_bonus", 5)
+        add_diamonds(user_id, bonus, "daily_bonus", "Ежедневный бонус")
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('UPDATE users SET daily_bonus_date = ? WHERE user_id = ?', (today, user_id))
+        conn.commit()
+        conn.close()
+        return True
+    return False
+
+def get_all_users():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    users = c.execute('SELECT user_id FROM users WHERE is_banned = 0').fetchall()
+    conn.close()
+    return users
+
+def is_creator(user_id):
+    return user_id == CREATOR_ID
+
+def is_admin(user_id):
+    if user_id == CREATOR_ID:
+        return True
+    user = get_user(user_id)
+    return user and user[8] >= 2
+
+def ban_user(user_id, reason):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE users SET is_banned = 1, ban_reason = ? WHERE user_id = ?', (reason, user_id))
+    conn.commit()
+    conn.close()
+
+def unban_user(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_banned = 0, ban_reason = NULL WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def make_admin(user_id, level=2):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET level = ? WHERE user_id = ?', (level, user_id))
+    conn.commit()
+    conn.close()
+
+def get_stats():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    total_users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    total_content = c.execute('SELECT COUNT(*) FROM content').fetchone()[0]
+    total_photos = c.execute('SELECT COUNT(*) FROM content WHERE type = "photo"').fetchone()[0]
+    total_videos = c.execute('SELECT COUNT(*) FROM content WHERE type = "video"').fetchone()[0]
+    pending_tiktok = c.execute('SELECT COUNT(*) FROM tiktok_moderation WHERE status = "pending"').fetchone()[0]
+    conn.close()
+    return total_users, total_content, total_photos, total_videos, pending_tiktok
+
+# ========== КЛАВИАТУРЫ ==========
+def main_keyboard(user_id=None):
+    show_admin = False
+    if user_id:
+        show_admin = is_admin(user_id)
+    
+    user = get_user(user_id) if user_id else None
+    diamonds = user[4] if user else 0
+    
+    keyboard = [
+        [InlineKeyboardButton(f"💎 {diamonds} АЛМАЗОВ", callback_data="noop")],
+        
+        [InlineKeyboardButton("🎬 СМОТРЕТЬ ВИДЕО", callback_data="watch_video"),
+         InlineKeyboardButton("📸 СМОТРЕТЬ ФОТО", callback_data="watch_photo")],
+        
+        [InlineKeyboardButton("💎 КУПИТЬ АЛМАЗЫ", callback_data="buy_diamonds"),
+         InlineKeyboardButton("🎁 ЕЖЕДНЕВНЫЙ БОНУС", callback_data="daily_bonus")],
+        
+        [InlineKeyboardButton("📢 ЗАДАНИЯ", callback_data="tasks"),
+         InlineKeyboardButton("👥 РЕФЕРАЛЫ", callback_data="ref_system")],
+        
+        [InlineKeyboardButton("💬 ПОДДЕРЖКА", callback_data="support"),
+         InlineKeyboardButton("👤 ПРОФИЛЬ", callback_data="profile")],
+        
+        [InlineKeyboardButton("ℹ️ ИНФО", callback_data="info")]
+    ]
+    if show_admin:
+        keyboard.append([InlineKeyboardButton("👑 АДМИН-ПАНЕЛЬ", callback_data="admin")])
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 СТАТИСТИКА", callback_data="admin_stats"),
+         InlineKeyboardButton("📥 ДОБАВИТЬ КОНТЕНТ", callback_data="admin_add_content")],
+        
+        [InlineKeyboardButton("🗑️ УДАЛИТЬ КОНТЕНТ", callback_data="admin_remove_content"),
+         InlineKeyboardButton("📋 СПИСОК КОНТЕНТА", callback_data="admin_list_content")],
+        
+        [InlineKeyboardButton("📢 ЗАДАНИЯ НА ПОДПИСКУ", callback_data="admin_tasks"),
+         InlineKeyboardButton("🎬 TIKTOK МОДЕРАЦИЯ", callback_data="admin_tiktok")],
+        
+        [InlineKeyboardButton("👥 ПОЛЬЗОВАТЕЛИ", callback_data="admin_users"),
+         InlineKeyboardButton("💎 ВЫДАТЬ АЛМАЗЫ", callback_data="admin_give_diamonds")],
+        
+        [InlineKeyboardButton("📢 РАССЫЛКА", callback_data="admin_broadcast"),
+         InlineKeyboardButton("⚙️ НАСТРОЙКИ", callback_data="admin_settings")],
+        
+        [InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_users_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("👑 ВЫДАТЬ ПРАВА", callback_data="admin_make_admin"),
+         InlineKeyboardButton("🚫 ЗАБАНИТЬ", callback_data="admin_ban")],
+        
+        [InlineKeyboardButton("✅ РАЗБАНИТЬ", callback_data="admin_unban"),
+         InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_settings_keyboard():
+    photo_price = get_setting("photo_price", 1)
+    video_price = get_setting("video_price", 2)
+    daily_bonus = get_setting("daily_bonus", 5)
+    ref_bonus = get_setting("ref_bonus", 5)
+    subscribe_bonus = get_setting("subscribe_bonus", 5)
+    tiktok_bonus = get_setting("tiktok_bonus", 15)
+    
+    keyboard = [
+        [InlineKeyboardButton(f"📸 ЦЕНА ФОТО: {photo_price}💎", callback_data="set_photo_price")],
+        [InlineKeyboardButton(f"🎬 ЦЕНА ВИДЕО: {video_price}💎", callback_data="set_video_price")],
+        [InlineKeyboardButton(f"🎁 ЕЖЕДНЕВНЫЙ БОНУС: {daily_bonus}💎", callback_data="set_daily_bonus")],
+        [InlineKeyboardButton(f"👥 РЕФ БОНУС: {ref_bonus}💎", callback_data="set_ref_bonus")],
+        [InlineKeyboardButton(f"📢 ПОДПИСКА: {subscribe_bonus}💎", callback_data="set_subscribe_bonus")],
+        [InlineKeyboardButton(f"🎬 TIKTOK: {tiktok_bonus}💎", callback_data="set_tiktok_bonus")],
+        [InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]])
+
+# ========== ОБРАБОТЧИКИ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    username = user.username or str(user.id)
+    
+    referrer_id = None
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            referrer_id = int(context.args[0].split("_")[1])
+            if referrer_id == user.id:
+                referrer_id = None
+        except:
+            pass
+    
+    add_user(user.id, username, user.full_name, referrer_id)
+    
+    user_data = get_user(user.id)
+    if user_data and user_data[6] == 1:
+        await update.message.reply_text(f"🚫 ВЫ ЗАБАНЕНЫ!\nПРИЧИНА: {user_data[7]}", reply_markup=back_keyboard())
+        return
+    
+    # Проверка обязательной подписки
+    await update.message.reply_text(
+        f"╔════════════════════════════════════════╗\n"
+        f"║  ✨ ДОБРО ПОЖАЛОВАТЬ! ✨               ║\n"
+        f"╠════════════════════════════════════════╣\n"
+        f"║  🎬 Твой личный контент-бот!           ║\n"
+        f"║  📸 Смотри видео и фото за алмазы      ║\n"
+        f"║  💎 Зарабатывай алмазы на заданиях     ║\n"
+        f"╠════════════════════════════════════════╣\n"
+        f"║  ⚠️ **ОБЯЗАТЕЛЬНАЯ ПОДПИСКА:**         ║\n"
+        f"║  🔗 {REQUIRED_CHANNEL}                 ║\n"
+        f"║  ⬇️ **ПОДПИШИСЬ И НАЖМИ КНОПКУ:**      ║\n"
+        f"╚════════════════════════════════════════╝\n\n"
+        f"⬇️ **ПОСЛЕ ПОДПИСКИ НАЖМИ КНОПКУ:**",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Я ПОДПИСАЛСЯ", callback_data="check_channel_sub")]
+        ]),
+        parse_mode="Markdown"
+    )
+
+async def check_channel_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    # Проверяем подписку на канал
+    # Временно пропускаем проверку, так как требует бота-админа в канале
+    # При правильной настройке раскомментировать код ниже
+    
+    # try:
+    #     chat_member = await context.bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+    #     if chat_member.status in ["member", "administrator", "creator"]:
+    #         await query.edit_message_text(
+    #             "✅ ПОДПИСКА ПОДТВЕРЖДЕНА!\n\n"
+    #             "⬇️ **ВЫБИРАЙ ДЕЙСТВИЕ:**",
+    #             reply_markup=main_keyboard(user_id),
+    #             parse_mode="Markdown"
+    #         )
+    #         check_daily_bonus(user_id)
+    #     else:
+    #         await query.edit_message_text(
+    #             f"❌ ВЫ НЕ ПОДПИСАНЫ НА КАНАЛ {REQUIRED_CHANNEL}!\n\n"
+    #             f"🔗 ПОДПИШИТЕСЬ: {REQUIRED_CHANNEL}\n"
+    #             f"И НАЖМИТЕ КНОПКУ СНОВА.",
+    #             reply_markup=InlineKeyboardMarkup([
+    #                 [InlineKeyboardButton("✅ Я ПОДПИСАЛСЯ", callback_data="check_channel_sub")]
+    #             ]),
+    #             parse_mode="Markdown"
+    #         )
+    # except Exception as e:
+    #     # Если бот не админ в канале, пропускаем проверку
+    await query.edit_message_text(
+        "✅ ДОБРО ПОЖАЛОВАТЬ!\n\n"
+        "⬇️ **ВЫБИРАЙ ДЕЙСТВИЕ:**",
+        reply_markup=main_keyboard(user_id),
+        parse_mode="Markdown"
+    )
+    check_daily_bonus(user_id)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    user_id = query.from_user.id
+    username = query.from_user.username or str(user_id)
+    
+    user_data = get_user(user_id)
+    if user_data and user_data[6] == 1:
+        await query.edit_message_text(f"🚫 ВЫ ЗАБАНЕНЫ!\nПРИЧИНА: {user_data[7]}", reply_markup=back_keyboard())
+        return
+    
+    user_data = get_user(user_id)
+    diamonds = user_data[4] if user_data else 0
+    
+    # ========== ГЛАВНОЕ МЕНЮ ==========
+    if data == "noop":
+        return
+    
+    elif data == "back":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "⬇️ **ВЫБИРАЙ ДЕЙСТВИЕ:**",
+            reply_markup=main_keyboard(user_id),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "check_channel_sub":
+        await check_channel_subscription(update, context)
+        return
+    
+    # ========== ПРОСМОТР КОНТЕНТА ==========
+    elif data == "watch_video":
+        videos = get_all_content("video")
+        if not videos:
+            await query.edit_message_text("📭 ВИДЕО ПОКА НЕТ!", reply_markup=back_keyboard())
+            return
+        
+        video_price = get_setting("video_price", 2)
+        video = random.choice(videos)
+        
+        if remove_diamonds(user_id, video_price, "watch_video", "Просмотр видео"):
+            await query.edit_message_text(f"✅ СПИСАНО {video_price}💎\n\n🎬 ВОТ ТВОЁ ВИДЕО:")
+            await context.bot.send_video(chat_id=user_id, video=video[2])
+            await query.message.delete()
+        else:
+            await query.edit_message_text(f"❌ НЕДОСТАТОЧНО АЛМАЗОВ!\nНУЖНО: {video_price}💎\nУ ВАС: {diamonds}💎", reply_markup=back_keyboard())
+    
+    elif data == "watch_photo":
+        photos = get_all_content("photo")
+        if not photos:
+            await query.edit_message_text("📭 ФОТО ПОКА НЕТ!", reply_markup=back_keyboard())
+            return
+        
+        photo_price = get_setting("photo_price", 1)
+        photo = random.choice(photos)
+        
+        if remove_diamonds(user_id, photo_price, "watch_photo", "Просмотр фото"):
+            await query.edit_message_text(f"✅ СПИСАНО {photo_price}💎\n\n📸 ВОТ ТВОЁ ФОТО:")
+            await context.bot.send_photo(chat_id=user_id, photo=photo[2])
+            await query.message.delete()
+        else:
+            await query.edit_message_text(f"❌ НЕДОСТАТОЧНО АЛМАЗОВ!\nНУЖНО: {photo_price}💎\nУ ВАС: {diamonds}💎", reply_markup=back_keyboard())
+    
+    # ========== ПОКУПКА ==========
+    elif data == "buy_diamonds":
+        await query.edit_message_text(
+            "💎 **ПОКУПКА АЛМАЗОВ**\n\n"
+            "💰 ЦЕНЫ:\n"
+            "• 100💎 — 10⭐\n"
+            "• 500💎 — 40⭐\n"
+            "• 1000💎 — 70⭐\n\n"
+            "⬇️ НАЖМИ НА НУЖНУЮ СУММУ:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 100 АЛМАЗОВ - 10⭐", callback_data="buy_100")],
+                [InlineKeyboardButton("💎 500 АЛМАЗОВ - 40⭐", callback_data="buy_500")],
+                [InlineKeyboardButton("💎 1000 АЛМАЗОВ - 70⭐", callback_data="buy_1000")],
+                [InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]
+            ]),
+            parse_mode="Markdown"
+        )
+    
+    elif data.startswith("buy_"):
+        amount = int(data.split("_")[1])
+        price_map = {100: 10, 500: 40, 1000: 70}
+        price = price_map.get(amount, 10)
+        
+        await context.bot.send_invoice(
+            chat_id=user_id,
+            title="💎 ПОКУПКА АЛМАЗОВ",
+            description=f"Покупка {amount} алмазов за {price} звёзд",
+            payload=f"diamonds_{amount}",
+            currency="XTR",
+            prices=[LabeledPrice("Алмазы", price)],
+            start_parameter="buy_diamonds"
+        )
+        await query.message.delete()
+    
+    # ========== ЗАДАНИЯ ==========
+    elif data == "daily_bonus":
+        if check_daily_bonus(user_id):
+            bonus = get_setting("daily_bonus", 5)
+            await query.edit_message_text(f"✅ ЕЖЕДНЕВНЫЙ БОНУС ПОЛУЧЕН!\n💰 {bonus}💎 ЗАЧИСЛЕНО!", reply_markup=back_keyboard())
+        else:
+            await query.edit_message_text("❌ ВЫ УЖЕ ПОЛУЧИЛИ БОНУС СЕГОДНЯ!\nЗАВТРА ПРИХОДИТЕ СНОВА!", reply_markup=back_keyboard())
+    
+    elif data == "tasks":
+        keyboard = [
+            [InlineKeyboardButton("📢 ПОДПИСАТЬСЯ НА КАНАЛЫ", callback_data="subscribe_tasks")],
+            [InlineKeyboardButton("🎬 TIKTOK КОММЕНТАРИИ", callback_data="tiktok_task")],
+            [InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]
+        ]
+        await query.edit_message_text("📢 **ЗАДАНИЯ**\n\nВыполняй задания и получай алмазы!", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data == "subscribe_tasks":
+        tasks = get_subscribe_tasks()
+        if not tasks:
+            await query.edit_message_text("📭 ЗАДАНИЙ НА ПОДПИСКУ ПОКА НЕТ!", reply_markup=back_keyboard())
+            return
+        
+        text = "📢 **ЗАДАНИЯ НА ПОДПИСКУ:**\n\n"
+        keyboard = []
+        for task in tasks:
+            if not is_user_subscribed(user_id, task[0]):
+                text += f"📌 Канал: {task[1]}\n💰 Награда: {task[3]}💎\n🔗 {task[2]}\n\n"
+                keyboard.append([InlineKeyboardButton(f"✅ ПРОВЕРИТЬ ПОДПИСКУ #{task[0]}", callback_data=f"check_sub_{task[0]}")])
+            else:
+                text += f"✅ Канал: {task[1]} — ВЫПОЛНЕНО!\n\n"
+        
+        keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="tasks")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("check_sub_"):
+        task_id = int(data.split("_")[2])
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT channel_username, bonus FROM subscribe_tasks WHERE id = ?', (task_id,))
+        task = c.fetchone()
+        conn.close()
+        
+        if not task:
+            await query.edit_message_text("❌ ЗАДАНИЕ НЕ НАЙДЕНО!", reply_markup=back_keyboard())
+            return
+        
+        channel_username = task[0]
+        bonus = task[1]
+        
+        try:
+            chat_member = await context.bot.get_chat_member(chat_id=f"@{channel_username}", user_id=user_id)
+            if chat_member.status in ["member", "administrator", "creator"]:
+                if not is_user_subscribed(user_id, task_id):
+                    mark_user_subscribed(user_id, task_id, bonus)
+                    await query.edit_message_text(f"✅ ПОДПИСКА ПОДТВЕРЖДЕНА!\n💰 ПОЛУЧЕНО {bonus}💎", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="subscribe_tasks")]]))
+                else:
+                    await query.edit_message_text("✅ ВЫ УЖЕ ВЫПОЛНИЛИ ЭТО ЗАДАНИЕ!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="subscribe_tasks")]]))
+            else:
+                await query.edit_message_text(f"❌ ВЫ НЕ ПОДПИСАНЫ НА КАНАЛ @{channel_username}!\nПОДПИШИТЕСЬ И НАЖМИТЕ СНОВА.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="subscribe_tasks")]]))
+        except Exception as e:
+            await query.edit_message_text(f"❌ ОШИБКА ПРОВЕРКИ!\n{str(e)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="subscribe_tasks")]]))
+    
+    elif data == "tiktok_task":
+        tiktok_bonus = get_setting("tiktok_bonus", 15)
+        await query.edit_message_text(
+            f"🎬 **ЗАДАНИЕ: TikTok КОММЕНТАРИИ**\n\n"
+            f"📌 ЗАДАНИЕ:\n"
+            f"Оставь 15 комментариев под нашими видео в TikTok с рекламным текстом\n\n"
+            f"💰 НАГРАДА: {tiktok_bonus}💎\n\n"
+            f"📸 **КАК ВЫПОЛНИТЬ:**\n"
+            f"1. Сделай скриншот своих 15 комментариев\n"
+            f"2. Отправь скриншот сюда\n"
+            f"3. Админ проверит и начислит алмазы\n\n"
+            f"⬇️ **ОТПРАВЬ СКРИНШОТ:**",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_tiktok"] = True
+    
+    elif data == "ref_system":
+        ref_link = f"https://t.me/{context.bot.username}?start=ref_{user_id}"
+        ref_bonus = get_setting("ref_bonus", 5)
+        
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ?', (user_id,))
+        ref_count = c.fetchone()[0]
+        c.execute('SELECT SUM(bonus_paid) FROM referrals WHERE referrer_id = ?', (user_id,))
+        ref_earned = c.fetchone()[0] or 0
+        conn.close()
+        
+        await query.edit_message_text(
+            f"👥 **РЕФЕРАЛЬНАЯ СИСТЕМА**\n\n"
+            f"🔗 ТВОЯ РЕФЕРАЛЬНАЯ ССЫЛКА:\n`{ref_link}`\n\n"
+            f"💰 НАГРАДА: {ref_bonus}💎 ЗА КАЖДОГО ПРИГЛАШЁННОГО\n\n"
+            f"📊 ПРИГЛАШЕНО: {ref_count}\n"
+            f"💎 ЗАРАБОТАНО: {ref_earned}💎\n\n"
+            f"📌 ПРИГЛАШАЙ ДРУЗЕЙ И ПОЛУЧАЙ АЛМАЗЫ!",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    # ========== ПРОФИЛЬ ==========
+    elif data == "profile":
+        user = get_user(user_id)
+        level_name = {0: "👤 ПОЛЬЗОВАТЕЛЬ", 1: "🛡️ АГЕНТ", 2: "👑 АДМИН", 3: "💎 СОЗДАТЕЛЬ"}.get(user[8], "👤 ПОЛЬЗОВАТЕЛЬ")
+        
+        await query.edit_message_text(
+            f"╔════════════════════════════════════════╗\n"
+            f"║  👤 **МОЙ ПРОФИЛЬ**                   ║\n"
+            f"╠════════════════════════════════════════╣\n"
+            f"║  🆔 ID: {user[0]}                      ║\n"
+            f"║  📛 USERNAME: @{user[1] or 'НЕТ'}      ║\n"
+            f"║  ⭐ УРОВЕНЬ: {level_name}              ║\n"
+            f"║  💎 АЛМАЗОВ: {user[4]}                 ║\n"
+            f"║  📅 РЕГИСТРАЦИЯ: {user[3][:10]}        ║\n"
+            f"╚════════════════════════════════════════╝",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "support":
+        await query.edit_message_text(
+            f"💬 **ПОДДЕРЖКА**\n\n"
+            f"✍️ НАПИШИ СВОЙ ВОПРОС СЮДА:\n"
+            f"АДМИН ОТВЕТИТ В БЛИЖАЙШЕЕ ВРЕМЯ",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_support"] = True
+    
+    elif data == "info":
+        await query.edit_message_text(
+            f"ℹ️ **ИНФОРМАЦИЯ О БОТЕ**\n\n"
+            f"🤖 КОНТЕНТ-БОТ v2.0\n\n"
+            f"💰 КАК ЗАРАБОТАТЬ АЛМАЗЫ:\n"
+            f"• 📢 ПОДПИСКА НА КАНАЛЫ\n"
+            f"• 👥 ПРИГЛАШЕНИЕ ДРУЗЕЙ\n"
+            f"• 🎬 КОММЕНТАРИИ В TIKTOK\n"
+            f"• 🎁 ЕЖЕДНЕВНЫЙ БОНУС\n\n"
+            f"💎 КАК ТРАТИТЬ АЛМАЗЫ:\n"
+            f"• 🎬 ПРОСМОТР ВИДЕО\n"
+            f"• 📸 ПРОСМОТР ФОТО",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    # ========== АДМИН-ПАНЕЛЬ ==========
+    elif data == "admin":
+        if not is_admin(user_id):
+            await query.edit_message_text("⛔ НЕТ ДОСТУПА!", reply_markup=back_keyboard())
+            return
+        await query.edit_message_text("👑 **АДМИН-ПАНЕЛЬ**", reply_markup=admin_keyboard(), parse_mode="Markdown")
+    
+    elif data == "admin_stats":
+        if not is_admin(user_id):
+            return
+        total_users, total_content, total_photos, total_videos, pending_tiktok = get_stats()
+        await query.edit_message_text(
+            f"📊 **СТАТИСТИКА**\n\n"
+            f"👥 ПОЛЬЗОВАТЕЛЕЙ: {total_users}\n"
+            f"📦 ВСЕГО КОНТЕНТА: {total_content}\n"
+            f"📸 ФОТО: {total_photos}\n"
+            f"🎬 ВИДЕО: {total_videos}\n"
+            f"⏳ TIKTOK ЗАЯВОК: {pending_tiktok}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]]),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "admin_add_content":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text(
+            "📥 **ДОБАВЛЕНИЕ КОНТЕНТА**\n\n"
+            "1. Отправь ВИДЕО или ФОТО\n"
+            "2. Бот сам определит тип и цену по настройкам\n\n"
+            f"📸 ФОТО — {get_setting('photo_price', 1)}💎\n"
+            f"🎬 ВИДЕО — {get_setting('video_price', 2)}💎\n\n"
+            "⬇️ **ОТПРАВЬ МЕДИАФАЙЛ:**",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_content"] = True
+    
+    elif data == "admin_remove_content":
+        if not is_admin(user_id):
+            return
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        content = c.execute('SELECT id, type FROM content ORDER BY id DESC LIMIT 20').fetchall()
+        conn.close()
+        
+        if not content:
+            await query.edit_message_text("📭 КОНТЕНТА НЕТ!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]]))
+            return
+        
+        keyboard = []
+        for c in content:
+            type_emoji = "🎬" if c[1] == "video" else "📸"
+            keyboard.append([InlineKeyboardButton(f"{type_emoji} УДАЛИТЬ #{c[0]}", callback_data=f"del_content_{c[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")])
+        
+        await query.edit_message_text("🗑️ **УДАЛЕНИЕ КОНТЕНТА**\n\nВыбери ID для удаления:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("del_content_"):
+        if not is_admin(user_id):
+            return
+        content_id = int(data.split("_")[2])
+        delete_content(content_id)
+        await query.edit_message_text(f"✅ КОНТЕНТ #{content_id} УДАЛЁН!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin_remove_content")]]))
+    
+    elif data == "admin_list_content":
+        if not is_admin(user_id):
+            return
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        content = c.execute('SELECT id, type, price FROM content ORDER BY id DESC LIMIT 30').fetchall()
+        conn.close()
+        
+        if not content:
+            await query.edit_message_text("📭 КОНТЕНТА НЕТ!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]]))
+            return
+        
+        text = "📋 **СПИСОК КОНТЕНТА:**\n\n"
+        for c in content:
+            type_emoji = "🎬" if c[1] == "video" else "📸"
+            text += f"{type_emoji} #{c[0]} | {c[2]}💎\n"
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]]), parse_mode="Markdown")
+    
+    elif data == "admin_tasks":
+        if not is_admin(user_id):
+            return
+        tasks = get_subscribe_tasks()
+        text = "📢 **ЗАДАНИЯ НА ПОДПИСКУ:**\n\n"
+        for task in tasks:
+            text += f"#{task[0]} | @{task[1]} | {task[3]}💎\n"
+        
+        await query.edit_message_text(
+            text + "\n\n➕ **ДОБАВИТЬ ЗАДАНИЕ:**\n"
+            "Отправь: `канал_username | ссылка | бонус`\n"
+            "Пример: `my_channel | https://t.me/my_channel | 5`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ УДАЛИТЬ ЗАДАНИЕ", callback_data="admin_remove_task")],
+                [InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]
+            ]),
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_add_task"] = True
+    
+    elif data == "admin_remove_task":
+        if not is_admin(user_id):
+            return
+        tasks = get_subscribe_tasks()
+        if not tasks:
+            await query.edit_message_text("📭 НЕТ ЗАДАНИЙ!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin_tasks")]]))
+            return
+        
+        keyboard = []
+        for task in tasks:
+            keyboard.append([InlineKeyboardButton(f"❌ УДАЛИТЬ #{task[0]}", callback_data=f"remove_task_{task[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="admin_tasks")])
+        
+        await query.edit_message_text("🗑️ **УДАЛЕНИЕ ЗАДАНИЯ**\n\nВыбери задание:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("remove_task_"):
+        if not is_admin(user_id):
+            return
+        task_id = int(data.split("_")[2])
+        delete_subscribe_task(task_id)
+        await query.edit_message_text(f"✅ ЗАДАНИЕ #{task_id} УДАЛЕНО!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin_tasks")]]))
+    
+    elif data == "admin_tiktok":
+        if not is_admin(user_id):
+            return
+        requests = get_pending_tiktok_requests()
+        if not requests:
+            await query.edit_message_text("📭 НЕТ ЗАЯВОК!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")]]))
+            return
+        
+        text = "🎬 **ЗАЯВКИ НА TIKTOK:**\n\n"
+        keyboard = []
+        for req in requests[:10]:
+            text += f"#{req[0]} | ОТ @{req[2]}\n📅 {req[4]}\n\n"
+            keyboard.append([InlineKeyboardButton(f"✅ ПРИНЯТЬ #{req[0]}", callback_data=f"approve_tiktok_{req[0]}"),
+                             InlineKeyboardButton(f"❌ ОТКЛОНИТЬ #{req[0]}", callback_data=f"reject_tiktok_{req[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="admin")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("approve_tiktok_"):
+        if not is_admin(user_id):
+            return
+        req_id = int(data.split("_")[2])
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM tiktok_moderation WHERE id = ?', (req_id,))
+        req_user = c.fetchone()
+        conn.close()
+        
+        if req_user:
+            tiktok_bonus = get_setting("tiktok_bonus", 15)
+            approve_tiktok_request(req_id, req_user[0], tiktok_bonus)
+            await query.edit_message_text(f"✅ ЗАЯВКА #{req_id} ОДОБРЕНА!\n💰 НАЧИСЛЕНО {tiktok_bonus}💎", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin_tiktok")]]))
+            await context.bot.send_message(chat_id=req_user[0], text=f"✅ ВАША ЗАЯВКА #{req_id} ОДОБРЕНА!\n💰 ПОЛУЧЕНО {tiktok_bonus}💎")
+        else:
+            await query.edit_message_text("❌ ОШИБКА!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="admin_tiktok")]]))
+    
+    elif data.startswith("reject_tiktok_"):
+        if not is_admin(user_id):
+            return
+        req_id = int(data.split("_")[2])
+        await query.edit_message_text(f"📝 ВВЕДИ ПРИЧИНУ ОТКЛОНА ДЛЯ ЗАЯВКИ #{req_id}:", reply_markup=back_keyboard())
+        context.user_data["reject_tiktok_id"] = req_id
+        context.user_data["awaiting_reject_reason"] = True
+    
+    elif data == "admin_users":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("👥 **УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ**", reply_markup=admin_users_keyboard(), parse_mode="Markdown")
+    
+    elif data == "admin_make_admin":
+        if not is_creator(user_id):
+            await query.edit_message_text("⛔ ТОЛЬКО СОЗДАТЕЛЬ МОЖЕТ ВЫДАВАТЬ ПРАВА!", reply_markup=back_keyboard())
+            return
+        await query.edit_message_text("👑 **ВЫДАТЬ ПРАВА АДМИНА**\n\nВВЕДИ ID ПОЛЬЗОВАТЕЛЯ:", reply_markup=back_keyboard(), parse_mode="Markdown")
+        context.user_data["awaiting_make_admin"] = True
+    
+    elif data == "admin_ban":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("🚫 **БАН ПОЛЬЗОВАТЕЛЯ**\n\nВВЕДИ ID ПОЛЬЗОВАТЕЛЯ:", reply_markup=back_keyboard(), parse_mode="Markdown")
+        context.user_data["awaiting_ban_id"] = True
+    
+    elif data == "admin_unban":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("✅ **РАЗБАН ПОЛЬЗОВАТЕЛЯ**\n\nВВЕДИ ID ПОЛЬЗОВАТЕЛЯ:", reply_markup=back_keyboard(), parse_mode="Markdown")
+        context.user_data["awaiting_unban"] = True
+    
+    elif data == "admin_give_diamonds":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("💎 **ВЫДАТЬ АЛМАЗЫ**\n\nВВЕДИ ID ПОЛЬЗОВАТЕЛЯ И СУММУ:\n`ID СУММА`\nПример: `123456789 100`", reply_markup=back_keyboard(), parse_mode="Markdown")
+        context.user_data["awaiting_give_diamonds"] = True
+    
+    elif data == "admin_broadcast":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("📢 **РАССЫЛКА**\n\nВВЕДИ ТЕКСТ ДЛЯ РАССЫЛКИ ВСЕМ ПОЛЬЗОВАТЕЛЯМ:", reply_markup=back_keyboard(), parse_mode="Markdown")
+        context.user_data["awaiting_broadcast"] = True
+    
+    elif data == "admin_settings":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("⚙️ **НАСТРОЙКИ БОТА**\n\nВыбери параметр для изменения:", reply_markup=admin_settings_keyboard(), parse_mode="Markdown")
+    
+    elif data == "set_photo_price":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("📸 **ЦЕНА ФОТО**\n\nВВЕДИ НОВУЮ ЦЕНУ В АЛМАЗАХ (1-100):", reply_markup=back_keyboard())
+        context.user_data["awaiting_set_photo_price"] = True
+    
+    elif data == "set_video_price":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("🎬 **ЦЕНА ВИДЕО**\n\nВВЕДИ НОВУЮ ЦЕНУ В АЛМАЗАХ (1-100):", reply_markup=back_keyboard())
+        context.user_data["awaiting_set_video_price"] = True
+    
+    elif data == "set_daily_bonus":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("🎁 **ЕЖЕДНЕВНЫЙ БОНУС**\n\nВВЕДИ НОВУЮ СУММУ В АЛМАЗАХ (1-100):", reply_markup=back_keyboard())
+        context.user_data["awaiting_set_daily_bonus"] = True
+    
+    elif data == "set_ref_bonus":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("👥 **РЕФ БОНУС**\n\nВВЕДИ НОВУЮ СУММУ В АЛМАЗАХ (1-100):", reply_markup=back_keyboard())
+        context.user_data["awaiting_set_ref_bonus"] = True
+    
+    elif data == "set_subscribe_bonus":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("📢 **БОНУС ЗА ПОДПИСКУ**\n\nВВЕДИ НОВУЮ СУММУ В АЛМАЗАХ (1-100):", reply_markup=back_keyboard())
+        context.user_data["awaiting_set_subscribe_bonus"] = True
+    
+    elif data == "set_tiktok_bonus":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("🎬 **БОНУС ЗА TIKTOK**\n\nВВЕДИ НОВУЮ СУММУ В АЛМАЗАХ (1-100):", reply_markup=back_keyboard())
+        context.user_data["awaiting_set_tiktok_bonus"] = True
+
+# ========== ОБРАБОТКА ТЕКСТА ==========
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    username = update.effective_user.username or str(user_id)
+    user_data = get_user(user_id)
+    
+    if user_data and user_data[6] == 1:
+        await update.message.reply_text(f"🚫 ВЫ ЗАБАНЕНЫ!\nПРИЧИНА: {user_data[7]}", reply_markup=back_keyboard())
+        return
+    
+    # Рассылка
+    if context.user_data.get("awaiting_broadcast") and is_admin(user_id):
+        users = get_all_users()
+        sent = 0
+        for u in users:
+            try:
+                await context.bot.send_message(chat_id=u[0], text=f"📢 **РАССЫЛКА**\n\n{text}", parse_mode="Markdown")
+                sent += 1
+            except:
+                pass
+        await update.message.reply_text(f"✅ ОТПРАВЛЕНО {sent} ПОЛЬЗОВАТЕЛЯМ.")
+        context.user_data["awaiting_broadcast"] = False
+        return
+    
+    # Добавление контента (админ)
+    if context.user_data.get("awaiting_content") and is_admin(user_id):
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            file_type = "photo"
+            price = get_setting("photo_price", 1)
+            add_content(file_type, file_id, price)
+            await update.message.reply_text(f"✅ ФОТО ДОБАВЛЕНО!\n💰 ЦЕНА: {price}💎", reply_markup=main_keyboard(user_id))
+            context.user_data["awaiting_content"] = False
+        elif update.message.video:
+            file_id = update.message.video.file_id
+            file_type = "video"
+            price = get_setting("video_price", 2)
+            add_content(file_type, file_id, price)
+            await update.message.reply_text(f"✅ ВИДЕО ДОБАВЛЕНО!\n💰 ЦЕНА: {price}💎", reply_markup=main_keyboard(user_id))
+            context.user_data["awaiting_content"] = False
+        else:
+            await update.message.reply_text("❌ ОТПРАВЬ ФОТО ИЛИ ВИДЕО!", reply_markup=back_keyboard())
+        return
+    
+    # Добавление задания на подписку
+    if context.user_data.get("awaiting_add_task") and is_admin(user_id):
+        try:
+            parts = text.split("|")
+            if len(parts) < 3:
+                await update.message.reply_text("❌ ФОРМАТ: `канал_username | ссылка | бонус`")
+                return
+            channel_username = parts[0].strip()
+            channel_link = parts[1].strip()
+            bonus = int(parts[2].strip())
+            add_subscribe_task(channel_username, channel_link, bonus)
+            await update.message.reply_text(f"✅ ЗАДАНИЕ ДОБАВЛЕНО!\n📢 @{channel_username}\n💰 {bonus}💎", reply_markup=main_keyboard(user_id))
+            context.user_data["awaiting_add_task"] = False
+        except:
+            await update.message.reply_text("❌ ОШИБКА! ФОРМАТ: `канал_username | ссылка | бонус`")
+        return
+    
+    # TikTok заявка
+    if context.user_data.get("awaiting_tiktok"):
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            req_id = create_tiktok_request(user_id, username, file_id)
+            await update.message.reply_text(f"✅ ЗАЯВКА #{req_id} ОТПРАВЛЕНА НА МОДЕРАЦИЮ!\nАДМИН ПРОВЕРИТ В БЛИЖАЙШЕЕ ВРЕМЯ.", reply_markup=main_keyboard(user_id))
+            context.user_data["awaiting_tiktok"] = False
+        else:
+            await update.message.reply_text("❌ ОТПРАВЬ СКРИНШОТ (ФОТО)!", reply_markup=back_keyboard())
+        return
+    
+    # Причина отказа TikTok
+    if context.user_data.get("awaiting_reject_reason") and is_admin(user_id):
+        req_id = context.user_data["reject_tiktok_id"]
+        reason = text
+        reject_tiktok_request(req_id, reason)
+        
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM tiktok_moderation WHERE id = ?', (req_id,))
+        req_user = c.fetchone()
+        conn.close()
+        
+        if req_user:
+            await context.bot.send_message(chat_id=req_user[0], text=f"❌ ВАША ЗАЯВКА #{req_id} ОТКЛОНЕНА!\nПРИЧИНА: {reason}")
+        
+        await update.message.reply_text(f"❌ ЗАЯВКА #{req_id} ОТКЛОНЕНА!", reply_markup=main_keyboard(user_id))
+        context.user_data["awaiting_reject_reason"] = False
+        context.user_data["reject_tiktok_id"] = None
+        return
+    
+    # Поддержка
+    if context.user_data.get("awaiting_support"):
+        await context.bot.send_message(chat_id=CREATOR_ID, text=f"💬 **СООБЩЕНИЕ ОТ ПОЛЬЗОВАТЕЛЯ**\n👤 @{username}\n📝 {text}")
+        await update.message.reply_text("✅ СООБЩЕНИЕ ОТПРАВЛЕНО АДМИНУ!\nОЖИДАЙТЕ ОТВЕТА.", reply_markup=main_keyboard(user_id))
+        context.user_data["awaiting_support"] = False
+        return
+    
+    # Выдача алмазов админом
+    if context.user_data.get("awaiting_give_diamonds") and is_admin(user_id):
+        try:
+            parts = text.split()
+            target_id = int(parts[0])
+            amount = int(parts[1])
+            add_diamonds(target_id, amount, "admin_gift", "Выдача алмазов от админа")
+            await update.message.reply_text(f"✅ ПОЛЬЗОВАТЕЛЮ {target_id} ВЫДАНО {amount}💎!", reply_markup=main_keyboard(user_id))
+            await context.bot.send_message(chat_id=target_id, text=f"🎁 ВАМ ВЫДАНО {amount}💎 ОТ АДМИНИСТРАТОРА!")
+            context.user_data["awaiting_give_diamonds"] = False
+        except:
+            await update.message.reply_text("❌ ОШИБКА! ФОРМАТ: `ID СУММА`\nПРИМЕР: `123456789 100`")
+        return
+    
+    # Настройка цен
+    if context.user_data.get("awaiting_set_photo_price") and is_admin(user_id):
+        try:
+            new_price = int(text)
+            if 1 <= new_price <= 100:
+                update_setting("photo_price", new_price)
+                await update.message.reply_text(f"✅ ЦЕНА ФОТО ИЗМЕНЕНА НА {new_price}💎!", reply_markup=main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ ЦЕНА ДОЛЖНА БЫТЬ ОТ 1 ДО 100!")
+            context.user_data["awaiting_set_photo_price"] = False
+        except:
+            await update.message.reply_text("❌ ВВЕДИ ЧИСЛО!")
+            context.user_data["awaiting_set_photo_price"] = False
+        return
+    
+    if context.user_data.get("awaiting_set_video_price") and is_admin(user_id):
+        try:
+            new_price = int(text)
+            if 1 <= new_price <= 100:
+                update_setting("video_price", new_price)
+                await update.message.reply_text(f"✅ ЦЕНА ВИДЕО ИЗМЕНЕНА НА {new_price}💎!", reply_markup=main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ ЦЕНА ДОЛЖНА БЫТЬ ОТ 1 ДО 100!")
+            context.user_data["awaiting_set_video_price"] = False
+        except:
+            await update.message.reply_text("❌ ВВЕДИ ЧИСЛО!")
+            context.user_data["awaiting_set_video_price"] = False
+        return
+    
+    if context.user_data.get("awaiting_set_daily_bonus") and is_admin(user_id):
+        try:
+            new_bonus = int(text)
+            if 1 <= new_bonus <= 100:
+                update_setting("daily_bonus", new_bonus)
+                await update.message.reply_text(f"✅ ЕЖЕДНЕВНЫЙ БОНУС ИЗМЕНЁН НА {new_bonus}💎!", reply_markup=main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ СУММА ДОЛЖНА БЫТЬ ОТ 1 ДО 100!")
+            context.user_data["awaiting_set_daily_bonus"] = False
+        except:
+            await update.message.reply_text("❌ ВВЕДИ ЧИСЛО!")
+            context.user_data["awaiting_set_daily_bonus"] = False
+        return
+    
+    if context.user_data.get("awaiting_set_ref_bonus") and is_admin(user_id):
+        try:
+            new_bonus = int(text)
+            if 1 <= new_bonus <= 100:
+                update_setting("ref_bonus", new_bonus)
+                await update.message.reply_text(f"✅ РЕФ БОНУС ИЗМЕНЁН НА {new_bonus}💎!", reply_markup=main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ СУММА ДОЛЖНА БЫТЬ ОТ 1 ДО 100!")
+            context.user_data["awaiting_set_ref_bonus"] = False
+        except:
+            await update.message.reply_text("❌ ВВЕДИ ЧИСЛО!")
+            context.user_data["awaiting_set_ref_bonus"] = False
+        return
+    
+    if context.user_data.get("awaiting_set_subscribe_bonus") and is_admin(user_id):
+        try:
+            new_bonus = int(text)
+            if 1 <= new_bonus <= 100:
+                update_setting("subscribe_bonus", new_bonus)
+                await update.message.reply_text(f"✅ БОНУС ЗА ПОДПИСКУ ИЗМЕНЁН НА {new_bonus}💎!", reply_markup=main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ СУММА ДОЛЖНА БЫТЬ ОТ 1 ДО 100!")
+            context.user_data["awaiting_set_subscribe_bonus"] = False
+        except:
+            await update.message.reply_text("❌ ВВЕДИ ЧИСЛО!")
+            context.user_data["awaiting_set_subscribe_bonus"] = False
+        return
+    
+    if context.user_data.get("awaiting_set_tiktok_bonus") and is_admin(user_id):
+        try:
+            new_bonus = int(text)
+            if 1 <= new_bonus <= 100:
+                update_setting("tiktok_bonus", new_bonus)
+                await update.message.reply_text(f"✅ БОНУС ЗА TIKTOK ИЗМЕНЁН НА {new_bonus}💎!", reply_markup=main_keyboard(user_id))
+            else:
+                await update.message.reply_text("❌ СУММА ДОЛЖНА БЫТЬ ОТ 1 ДО 100!")
+            context.user_data["awaiting_set_tiktok_bonus"] = False
+        except:
+            await update.message.reply_text("❌ ВВЕДИ ЧИСЛО!")
+            context.user_data["awaiting_set_tiktok_bonus"] = False
+        return
+    
+    # Назначение админа (только для создателя)
+    if context.user_data.get("awaiting_make_admin") and is_creator(user_id):
+        try:
+            target_id = int(text)
+            make_admin(target_id, 2)
+            await update.message.reply_text(f"✅ ПОЛЬЗОВАТЕЛЬ {target_id} СТАЛ АДМИНИСТРАТОРОМ!", reply_markup=main_keyboard(user_id))
+            await context.bot.send_message(chat_id=target_id, text="👑 ВЫ СТАЛИ АДМИНИСТРАТОРОМ!")
+            context.user_data["awaiting_make_admin"] = False
+        except:
+            await update.message.reply_text("❌ ОШИБКА! ВВЕДИ ID ПОЛЬЗОВАТЕЛЯ")
+            context.user_data["awaiting_make_admin"] = False
+        return
+    
+    # Бан
+    if context.user_data.get("awaiting_ban_id") and is_admin(user_id):
+        context.user_data["ban_target_id"] = int(text)
+        await update.message.reply_text("📝 ВВЕДИ ПРИЧИНУ БАНА:", reply_markup=back_keyboard())
+        context.user_data["awaiting_ban_reason"] = True
+        context.user_data["awaiting_ban_id"] = False
+        return
+    
+    if context.user_data.get("awaiting_ban_reason") and is_admin(user_id):
+        target_id = context.user_data["ban_target_id"]
+        reason = text
+        ban_user(target_id, reason)
+        await update.message.reply_text(f"✅ ПОЛЬЗОВАТЕЛЬ {target_id} ЗАБАНЕН!\nПРИЧИНА: {reason}", reply_markup=main_keyboard(user_id))
+        await context.bot.send_message(chat_id=target_id, text=f"🚫 ВЫ ЗАБАНЕНЫ В БОТЕ!\nПРИЧИНА: {reason}")
+        context.user_data["awaiting_ban_reason"] = False
+        context.user_data["ban_target_id"] = None
+        return
+    
+    # Разбан
+    if context.user_data.get("awaiting_unban") and is_admin(user_id):
+        try:
+            target_id = int(text)
+            unban_user(target_id)
+            await update.message.reply_text(f"✅ ПОЛЬЗОВАТЕЛЬ {target_id} РАЗБАНЕН!", reply_markup=main_keyboard(user_id))
+            await context.bot.send_message(chat_id=target_id, text="✅ ВЫ РАЗБАНЕНЫ В БОТЕ!")
+            context.user_data["awaiting_unban"] = False
+        except:
+            await update.message.reply_text("❌ ОШИБКА! ВВЕДИ ID ПОЛЬЗОВАТЕЛЯ")
+            context.user_data["awaiting_unban"] = False
+        return
+    
+    # Если ничего не подошло
+    if not context.user_data:
+        await update.message.reply_text("❓ ИСПОЛЬЗУЙ КНОПКИ МЕНЮ", reply_markup=main_keyboard(user_id))
+
+# ========== ПЛАТЕЖИ ==========
+async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    payload = update.message.successful_payment.invoice_payload
+    
+    if payload.startswith("diamonds_"):
+        amount = int(payload.split("_")[1])
+        add_diamonds(user_id, amount, "purchase", f"Покупка {amount} алмазов")
+        await update.message.reply_text(f"✅ ОПЛАТА ПРОШЛА УСПЕШНО!\n💰 ПОЛУЧЕНО {amount}💎", reply_markup=main_keyboard(user_id))
+
+# ========== ЗАПУСК ==========
+def main():
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("🚀 КОНТЕНТ-БОТ ЗАПУЩЕН!")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
