@@ -1299,50 +1299,50 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 ВЫ ЗАБАНЕНЫ!\nПРИЧИНА: {user_data[7]}", reply_markup=back_keyboard())
         return
     
-    # Рассылка (исправленная)
-    if context.user_data.get("awaiting_broadcast") and is_admin(user_id):
-        conn = sqlite3.connect(DB_NAME, timeout=10)
-        c = conn.cursor()
-        users = c.execute('SELECT user_id FROM users WHERE is_banned = 0').fetchall()
-        conn.close()
-        
-        if not users:
-            await update.message.reply_text("❌ НЕТ ПОЛЬЗОВАТЕЛЕЙ ДЛЯ РАССЫЛКИ!", reply_markup=back_keyboard())
-            context.user_data["awaiting_broadcast"] = False
-            return
-        
-        broadcast_text = f"╔════════════════════════════════════════╗\n"
-        broadcast_text += f"║  📢 **СООБЩЕНИЕ ОТ АДМИНИСТРАЦИИ**     ║\n"
-        broadcast_text += f"╠════════════════════════════════════════╣\n"
-        broadcast_text += f"║                                        ║\n"
-        broadcast_text += f"║  {text}                                ║\n"
-        broadcast_text += f"║                                        ║\n"
-        broadcast_text += f"║  ═══════════════════════════════════   ║\n"
-        broadcast_text += f"║                                        ║\n"
-        broadcast_text += f"║  🔗 **НАШ КАНАЛ:** {REQUIRED_CHANNEL}   ║\n"
-        broadcast_text += f"║  📌 **НА СЛУЧАЙ БЛОКИРОВКИ БОТА:**      ║\n"
-        broadcast_text += f"║  🔗 {REQUIRED_CHANNEL}                 ║\n"
-        broadcast_text += f"║                                        ║\n"
-        broadcast_text += f"╚════════════════════════════════════════╝"
-        
-        sent = 0
-        failed = 0
-        for u in users:
-            try:
-                await context.bot.send_message(chat_id=u[0], text=broadcast_text, parse_mode="Markdown")
-                sent += 1
-            except Exception as e:
-                failed += 1
-                print(f"Ошибка отправки {u[0]}: {e}")
-        
-        await update.message.reply_text(
-            f"✅ РАССЫЛКА ЗАВЕРШЕНА!\n"
-            f"📨 ОТПРАВЛЕНО: {sent}\n"
-            f"❌ НЕ ДОСТАВЛЕНО: {failed}",
-            reply_markup=main_keyboard(user_id)
-        )
+ # Рассылка (исправленная)
+if context.user_data.get("awaiting_broadcast") and is_admin(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    users = c.execute('SELECT user_id FROM users WHERE is_banned = 0').fetchall()
+    conn.close()
+    
+    if not users:
+        await update.message.reply_text("❌ НЕТ ПОЛЬЗОВАТЕЛЕЙ ДЛЯ РАССЫЛКИ!", reply_markup=back_keyboard())
         context.user_data["awaiting_broadcast"] = False
         return
+    
+    broadcast_text = f"╔════════════════════════════════════════╗\n"
+    broadcast_text += f"║  📢 **СООБЩЕНИЕ ОТ АДМИНИСТРАЦИИ**     ║\n"
+    broadcast_text += f"╠════════════════════════════════════════╣\n"
+    broadcast_text += f"║                                        ║\n"
+    broadcast_text += f"║  {text}                                ║\n"
+    broadcast_text += f"║                                        ║\n"
+    broadcast_text += f"║  ═══════════════════════════════════   ║\n"
+    broadcast_text += f"║                                        ║\n"
+    broadcast_text += f"║  🔗 **НАШ КАНАЛ:** {REQUIRED_CHANNEL}   ║\n"
+    broadcast_text += f"║  📌 **НА СЛУЧАЙ БЛОКИРОВКИ БОТА:**      ║\n"
+    broadcast_text += f"║  🔗 {REQUIRED_CHANNEL}                 ║\n"
+    broadcast_text += f"║                                        ║\n"
+    broadcast_text += f"╚════════════════════════════════════════╝"
+    
+    sent = 0
+    failed = 0
+    for u in users:
+        try:
+            await context.bot.send_message(chat_id=u[0], text=broadcast_text, parse_mode="Markdown")
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print(f"Ошибка отправки {u[0]}: {e}")
+    
+    await update.message.reply_text(
+        f"✅ РАССЫЛКА ЗАВЕРШЕНА!\n"
+        f"📨 ОТПРАВЛЕНО: {sent}\n"
+        f"❌ НЕ ДОСТАВЛЕНО: {failed}",
+        reply_markup=main_keyboard(user_id)
+    )
+    context.user_data["awaiting_broadcast"] = False
+    return
     
     # Промокод
     if context.user_data.get("awaiting_promocode"):
