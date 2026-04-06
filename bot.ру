@@ -599,13 +599,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎬 Твой личный контент-бот!\n"
             f"📸 Смотри видео и фото за алмазы\n"
             f"💎 Зарабатывай алмазы на заданиях\n\n"
-            f"⚠️ **ОБЯЗАТЕЛЬНАЯ ПОДПИСКА:**\n"
+            f"⚠️ ОБЯЗАТЕЛЬНАЯ ПОДПИСКА:\n"
             f"🔗 {REQUIRED_CHANNEL}\n\n"
-            f"⬇️ **ПОДПИШИСЬ И НАЖМИ КНОПКУ:**",
+            f"⬇️ ПОДПИШИСЬ И НАЖМИ КНОПКУ:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Я ПОДПИСАЛСЯ", callback_data="check_channel_sub")]
-            ]),
-            parse_mode="Markdown"
+            ])
         )
     else:
         await update.message.reply_text(
