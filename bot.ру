@@ -1,0 +1,375 @@
+import asyncio
+import json
+import os
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+
+# ========== КОНФИГУРАЦИЯ ==========
+TOKEN = "8775384317:AAEG2VX09L7wVWq8rk-pZI6FQ7_-kXAEN40"
+ADMIN_ID = 8592184380
+CHANNEL_REVIEWS_LINK = "https://t.me/doxerfrilenrep"
+CHANNEL_EXAMPLES_LINK = "https://t.me/doxerfliren_primeri"
+CHANNEL_REVIEWS_USERNAME = "doxerfrilenrep"      # для внутренней пересылки
+MY_USERNAME = "@doxerfrilen"
+
+# Настройки антиспама
+ANTISPAM_MINUTES = 5
+MIN_REVIEW_LENGTH = 5
+TIMEOUT_MINUTES = 5  # автосброс диалога через 5 минут бездействия
+
+# Состояния для ConversationHandler
+RATING, REVIEW_TEXT, CONFIRM = range(3)
+
+# ========== ХРАНИЛИЩЕ ДАННЫХ ==========
+REVIEWS_FILE = "reviews.json"
+LAST_TIME_FILE = "last_time.json"
+
+def load_reviews():
+    if os.path.exists(REVIEWS_FILE):
+        with open(REVIEWS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_reviews(reviews):
+    with open(REVIEWS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reviews, f, ensure_ascii=False, indent=2)
+
+def load_last_time():
+    if os.path.exists(LAST_TIME_FILE):
+        with open(LAST_TIME_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return {int(k): datetime.fromisoformat(v) for k, v in data.items()}
+    return {}
+
+def save_last_time(last_time):
+    data = {str(k): v.isoformat() for k, v in last_time.items()}
+    with open(LAST_TIME_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+reviews = load_reviews()
+last_review_time = load_last_time()
+next_review_id = max([r["id"] for r in reviews], default=0) + 1
+
+# ========== КЛАВИАТУРЫ ==========
+# Главная клавиатура (ReplyKeyboard)
+main_keyboard = ReplyKeyboardMarkup([
+    ["🎨 Примеры работ", "⭐ Оставить отзыв"],
+    ["📋 Мой профиль", "📢 Все отзывы"],
+    ["❓ FAQ / Инфо", "❌ Отменить всё"]
+], resize_keyboard=True)
+
+def rating_keyboard():
+    buttons = []
+    for i in range(1, 6):
+        stars = "🌟" * i
+        buttons.append(InlineKeyboardButton(stars, callback_data=f"rate_{i}"))
+    return InlineKeyboardMarkup([buttons])
+
+def confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать", callback_data="confirm_yes")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
+    ])
+
+cancel_inline = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def reset_dialog(context: ContextTypes.DEFAULT_TYPE):
+    """Полностью сбрасывает текущий диалог"""
+    if context.user_data:
+        context.user_data.clear()
+    # Также очищаем любые ожидающие состояния (через ConversationHandler это делается автоматически при возврате END)
+
+async def safe_send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
+    """Безопасная отправка сообщения с обработкой ошибок"""
+    try:
+        # Небольшая задержка, чтобы избежать flood control
+        await asyncio.sleep(0.1)
+        return True
+    except:
+        return False
+
+def get_profile_text():
+    active_reviews = [r for r in reviews if not r.get("deleted", False)]
+    if not active_reviews:
+        return ("📋 *Мой профиль*\n\n⭐ Средняя оценка: *нет отзывов*\n📊 Всего отзывов: 0\n"
+                "   👍 Положительных (4-5): 0\n   👎 Отрицательных (1-3): 0\n\nПока нет ни одного отзыва. Будь первым! ⭐")
+    total = len(active_reviews)
+    positive = sum(1 for r in active_reviews if r["rating"] >= 4)
+    negative = total - positive
+    avg = sum(r["rating"] for r in active_reviews) / total
+    last_three = active_reviews[-3:][::-1]
+    last_text = ""
+    for r in last_three:
+        stars = "🌟" * r["rating"]
+        username = r.get("username", "пользователь")
+        if not username or username == "None":
+            username = "пользователь"
+        date = r["date"][:10]
+        last_text += f"\n{stars} *{username}* ({date})\n_{r['text'][:80]}..._\n"
+    return (f"📋 *Мой профиль*\n\n⭐ Средняя оценка: *{avg:.1f} / 5.0*\n📊 Всего отзывов: {total}\n"
+            f"   👍 Положительных (4-5): {positive}\n   👎 Отрицательных (1-3): {negative}\n\n📝 *Последние отзывы:*{last_text}")
+
+def get_stats_for_admin():
+    active = [r for r in reviews if not r.get("deleted", False)]
+    if not active:
+        return "📊 *Статистика*\n\nНет отзывов."
+    avg = sum(r["rating"] for r in active) / len(active)
+    positive = sum(1 for r in active if r["rating"] >= 4)
+    unique_users = len(set(r["user_id"] for r in active))
+    return (f"📊 *Статистика*\n\nВсего отзывов: {len(active)}\nСредний рейтинг: {avg:.2f}\n"
+            f"Положительных: {positive}\nОтрицательных: {len(active) - positive}\nУникальных авторов: {unique_users}")
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    user = update.effective_user
+    await update.message.reply_text(
+        f"🎨 Привет, {user.first_name}!\n\nЯ — бот для сбора отзывов о работе дизайнера {MY_USERNAME}.\n"
+        f"Здесь ты можешь оценить мои аватарки и оставить честный отзыв.\n\n👇 Используй кнопки ниже, чтобы начать.",
+        reply_markup=main_keyboard
+    )
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    text = get_profile_text()
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Все отзывы", url=CHANNEL_REVIEWS_LINK)]])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def all_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    await update.message.reply_text(f"📢 Все отзывы публикуются в канале:\n{CHANNEL_REVIEWS_LINK}", reply_markup=main_keyboard)
+
+async def examples(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    await update.message.reply_text(f"🎨 Примеры моих работ:\n{CHANNEL_EXAMPLES_LINK}", reply_markup=main_keyboard)
+
+async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    faq_text = (
+        "❓ *FAQ / Информация*\n\n"
+        "📌 *Почему я делаю это бесплатно?*\n"
+        "Я только начинаю набирать репутацию как дизайнер аватарок. Бесплатные работы — это способ показать себя.\n\n"
+        "🎯 *Можно ли верить отзывам отсюда?*\n"
+        "Да. Все отзывы оставляют реальные пользователи Telegram. Каждый отзыв привязан к аккаунту автора.\n\n"
+        "👤 *К кому обратиться за аватаркой?*\n"
+        f"Ко мне — {MY_USERNAME}. Напишите в личные сообщения.\n\n"
+        "❓ *Какие аватарки я делаю?*\n"
+        "Аниме, арт, абстракции, минимализм, с персонажами — обсуждаем индивидуально.\n\n"
+        "⏳ *Сколько ждать?*\n"
+        "От 5 минут до 24 часов.\n\n"
+        "📢 *Где посмотреть примеры?*\n"
+        f"В канале: {CHANNEL_EXAMPLES_LINK}\n\n"
+        "📋 *Как оставить отзыв?*\n"
+        "Нажмите «⭐ Оставить отзыв», выберите оценку, напишите текст.\n\n"
+        "🔁 *Удалить отзыв:* /delete_my_review\n\n"
+        "🛡️ *Защита от спама:* не чаще 1 раза в 5 минут, минимум 5 символов."
+    )
+    await update.message.reply_text(faq_text, parse_mode="Markdown", reply_markup=main_keyboard)
+
+async def delete_my_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    user_id = update.effective_user.id
+    user_reviews = [r for r in reviews if r["user_id"] == user_id and not r.get("deleted", False)]
+    if not user_reviews:
+        await update.message.reply_text("❌ У вас нет отзывов для удаления.", reply_markup=main_keyboard)
+        return
+    last = max(user_reviews, key=lambda x: x["id"])
+    last["deleted"] = True
+    save_reviews(reviews)
+    await update.message.reply_text("✅ Ваш последний отзыв удалён.", reply_markup=main_keyboard)
+
+# ========== ОСТАВЛЕНИЕ ОТЗЫВА ==========
+async def start_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_dialog(context)
+    user_id = update.effective_user.id
+    now = datetime.now()
+    if user_id in last_review_time:
+        last = last_review_time[user_id]
+        if now - last < timedelta(minutes=ANTISPAM_MINUTES):
+            wait = ANTISPAM_MINUTES - (now - last).seconds // 60
+            await update.message.reply_text(f"⏳ Подождите {wait} мин перед следующим отзывом.", reply_markup=main_keyboard)
+            return ConversationHandler.END
+    await update.message.reply_text("⭐ *Оценка работы*\n\nПоставьте оценку от 1 до 5 звёзд:", parse_mode="Markdown", reply_markup=rating_keyboard())
+    return RATING
+
+async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rating = int(query.data.split("_")[1])
+    context.user_data["rating"] = rating
+    await query.edit_message_text(
+        f"Вы выбрали: {'🌟' * rating} ({rating}/5)\n\nНапишите текст отзыва.\n*Обязательно упомяните {MY_USERNAME}!*\n\nМин. длина — {MIN_REVIEW_LENGTH} символов.",
+        parse_mode="Markdown", reply_markup=cancel_inline
+    )
+    return REVIEW_TEXT
+
+async def review_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if len(text.strip()) < MIN_REVIEW_LENGTH:
+        await update.message.reply_text(f"❌ Слишком коротко (мин. {MIN_REVIEW_LENGTH} символов).\nНапишите снова:", reply_markup=cancel_inline)
+        return REVIEW_TEXT
+    if MY_USERNAME not in text:
+        await update.message.reply_text(f"⚠️ Упомяните {MY_USERNAME} в отзыве.\nНапишите снова:", reply_markup=cancel_inline)
+        return REVIEW_TEXT
+    context.user_data["review_text"] = text
+    rating = context.user_data["rating"]
+    preview = f"📝 *Предпросмотр*\n\nОценка: {'🌟' * rating} ({rating}/5)\nТекст: {text}\n\nВсё верно?"
+    await update.message.reply_text(preview, parse_mode="Markdown", reply_markup=confirm_keyboard())
+    return CONFIRM
+
+async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "confirm_yes":
+        user = query.from_user
+        rating = context.user_data["rating"]
+        text = context.user_data["review_text"]
+        username = f"@{user.username}" if user.username else None
+        global next_review_id
+        new_review = {
+            "id": next_review_id, "user_id": user.id, "username": username,
+            "rating": rating, "text": text, "date": datetime.now().isoformat(), "deleted": False
+        }
+        reviews.append(new_review)
+        save_reviews(reviews)
+        next_review_id += 1
+        last_review_time[user.id] = datetime.now()
+        save_last_time(last_review_time)
+        # Отправка в канал
+        await query.bot.send_message(
+            chat_id=f"@{CHANNEL_REVIEWS_USERNAME}",
+            text=f"⭐ *Новый отзыв о {MY_USERNAME}*\n\nОценка: {'🌟' * rating} ({rating}/5)\n"
+                 f"От: {username or 'пользователь'}\n📝 {text}",
+            parse_mode="Markdown"
+        )
+        await query.edit_message_text("✅ *Спасибо за отзыв!* Он опубликован в канале.", parse_mode="Markdown")
+        await query.message.reply_text("Главное меню:", reply_markup=main_keyboard)
+    else:
+        await query.edit_message_text("❌ Отмена.")
+        await query.message.reply_text("Главное меню:", reply_markup=main_keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("❌ Отменено.")
+        await update.callback_query.message.reply_text("Главное меню:", reply_markup=main_keyboard)
+    else:
+        await update.message.reply_text("❌ Отменено.", reply_markup=main_keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ========== АДМИН-ПАНЕЛЬ ==========
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+    reset_dialog(context)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🗑 Управление отзывами", callback_data="admin_manage")],
+        [InlineKeyboardButton("📤 Экспорт", callback_data="admin_export")]
+    ])
+    await update.message.reply_text("🔐 *Админ-панель*", parse_mode="Markdown", reply_markup=keyboard)
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "admin_stats":
+        await query.edit_message_text(get_stats_for_admin(), parse_mode="Markdown")
+    elif query.data == "admin_export":
+        active = [r for r in reviews if not r.get("deleted", False)]
+        with open("export.json", "w", encoding="utf-8") as f:
+            json.dump(active, f, ensure_ascii=False, indent=2)
+        await query.message.reply_document(document=open("export.json", "rb"), filename="reviews.json")
+        os.remove("export.json")
+        await query.message.reply_text("Готово.")
+    elif query.data == "admin_manage":
+        active = [r for r in reviews if not r.get("deleted", False)][-10:]
+        if not active:
+            await query.edit_message_text("Нет отзывов.")
+            return
+        for r in active[::-1]:
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{r['id']}")]])
+            await query.message.reply_text(f"ID {r['id']}: {'🌟'*r['rating']}\n{r['text'][:100]}", reply_markup=keyboard)
+        await query.delete_message()
+    elif query.data.startswith("del_"):
+        rid = int(query.data.split("_")[1])
+        for r in reviews:
+            if r["id"] == rid and not r.get("deleted", False):
+                r["deleted"] = True
+                save_reviews(reviews)
+                await query.edit_message_text(f"✅ Отзыв {rid} удалён.")
+                break
+    elif query.data == "admin_broadcast":
+        context.user_data["broadcast"] = True
+        await query.edit_message_text("Введите текст рассылки:")
+
+async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("broadcast") and update.effective_user.id == ADMIN_ID:
+        users = set(r["user_id"] for r in reviews if not r.get("deleted", False))
+        success = 0
+        for uid in users:
+            try:
+                await context.bot.send_message(uid, f"📢 *Рассылка:*\n\n{update.message.text}", parse_mode="Markdown")
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                pass
+        await update.message.reply_text(f"✅ Отправлено {success} пользователям.")
+        context.user_data.pop("broadcast", None)
+
+async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("broadcast"):
+        context.user_data.pop("broadcast")
+        await update.message.reply_text("Рассылка отменена.", reply_markup=main_keyboard)
+
+# ========== ОБРАБОТКА КНОПОК ==========
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "🎨 Примеры работ":
+        await examples(update, context)
+    elif text == "⭐ Оставить отзыв":
+        await start_review(update, context)
+    elif text == "📋 Мой профиль":
+        await profile(update, context)
+    elif text == "📢 Все отзывы":
+        await all_reviews(update, context)
+    elif text == "❓ FAQ / Инфо":
+        await faq(update, context)
+    elif text == "❌ Отменить всё":
+        await cancel_dialog(update, context)
+
+# ========== ЗАПУСК ==========
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("delete_my_review", delete_my_review))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("cancel_broadcast", cancel_broadcast))
+    conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^⭐ Оставить отзыв$"), start_review)],
+        states={
+            RATING: [CallbackQueryHandler(rating_callback, pattern="^rate_")],
+            REVIEW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, review_text)],
+            CONFIRM: [CallbackQueryHandler(confirm_callback, pattern="^confirm_")]
+        },
+        fallbacks=[CallbackQueryHandler(cancel_dialog, pattern="^cancel$"), CommandHandler("cancel", cancel_dialog)],
+        conversation_timeout=timedelta(minutes=TIMEOUT_MINUTES)
+    )
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(admin_|del_)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_text))
+    print("✅ Бот запущен")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
