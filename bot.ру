@@ -1,0 +1,186 @@
+import json
+import os
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+
+TOKEN = "8775384317:AAEG2VX09L7wVWq8rk-pZI6FQ7_-kXAEN40"
+ADMIN_ID = 8592184380
+CHANNEL_REVIEWS = "@doxerfrilenrep"
+MY_USERNAME = "@doxerfrilen"
+
+REVIEWS_FILE = "reviews.json"
+
+if os.path.exists(REVIEWS_FILE):
+    with open(REVIEWS_FILE, 'r', encoding='utf-8') as f:
+        reviews = json.load(f)
+else:
+    reviews = []
+
+def save_reviews():
+    with open(REVIEWS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(reviews, f, ensure_ascii=False, indent=2)
+
+# Клавиатура
+keyboard = ReplyKeyboardMarkup([
+    ["🎨 Примеры", "⭐ Отзыв"],
+    ["📊 Профиль", "📢 Канал"],
+    ["❓ FAQ"]
+], resize_keyboard=True)
+
+admin_keyboard = ReplyKeyboardMarkup([
+    ["🎨 Примеры", "⭐ Отзыв"],
+    ["📊 Профиль", "📢 Канал"],
+    ["❓ FAQ", "🔐 Админ"],
+], resize_keyboard=True)
+
+async def start(update, context):
+    user = update.effective_user
+    kb = admin_keyboard if user.id == ADMIN_ID else keyboard
+    await update.message.reply_text(
+        f"Привет, {user.first_name}!\n\nЯ бот для сбора отзывов о работе {MY_USERNAME}\n\nНажми на кнопку ниже:",
+        reply_markup=kb
+    )
+
+async def profile(update, context):
+    active = [r for r in reviews if not r.get("deleted", False)]
+    if not active:
+        text = "📊 ПРОФИЛЬ\n\n⭐ Нет отзывов"
+    else:
+        avg = sum(r["rating"] for r in active) / len(active)
+        text = f"📊 ПРОФИЛЬ\n\n⭐ Рейтинг: {avg:.1f}/5\n📊 Отзывов: {len(active)}"
+    kb = admin_keyboard if update.effective_user.id == ADMIN_ID else keyboard
+    await update.message.reply_text(text, reply_markup=kb)
+
+async def examples(update, context):
+    kb = admin_keyboard if update.effective_user.id == ADMIN_ID else keyboard
+    await update.message.reply_text("🎨 Примеры работ:\nhttps://t.me/doxerfliren_primeri", reply_markup=kb)
+
+async def channel(update, context):
+    kb = admin_keyboard if update.effective_user.id == ADMIN_ID else keyboard
+    await update.message.reply_text(f"📢 Канал с отзывами:\nhttps://t.me/{CHANNEL_REVIEWS[1:]}", reply_markup=kb)
+
+async def faq(update, context):
+    kb = admin_keyboard if update.effective_user.id == ADMIN_ID else keyboard
+    await update.message.reply_text(
+        f"❓ FAQ\n\nБесплатно - набираю репутацию\nОбращаться: {MY_USERNAME}\nСрок: 5мин-24ч\nУдалить отзыв: /delete",
+        reply_markup=kb
+    )
+
+async def delete_review(update, context):
+    user_id = update.effective_user.id
+    for r in reviews:
+        if r["user_id"] == user_id and not r.get("deleted", False):
+            r["deleted"] = True
+            save_reviews()
+            await update.message.reply_text("✅ Отзыв удалён")
+            return
+    await update.message.reply_text("❌ У вас нет отзывов")
+
+# Отзыв
+async def review_start(update, context):
+    context.user_data["waiting_review"] = True
+    buttons = [[
+        InlineKeyboardButton("⭐1", callback_data="r1"),
+        InlineKeyboardButton("⭐⭐2", callback_data="r2"),
+        InlineKeyboardButton("⭐⭐⭐3", callback_data="r3"),
+        InlineKeyboardButton("⭐⭐⭐⭐4", callback_data="r4"),
+        InlineKeyboardButton("⭐⭐⭐⭐⭐5", callback_data="r5")
+    ]]
+    await update.message.reply_text("Поставь оценку:", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def rating_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    rating = int(query.data[1])
+    context.user_data["rating"] = rating
+    context.user_data["waiting_text"] = True
+    await query.edit_message_text(f"Оценка: {'⭐'*rating}\n\nНапиши отзыв (упомяни {MY_USERNAME}):")
+
+async def review_text(update, context):
+    if context.user_data.get("waiting_text"):
+        text = update.message.text
+        if MY_USERNAME not in text:
+            await update.message.reply_text(f"Упомяни {MY_USERNAME} в отзыве")
+            return
+        rating = context.user_data["rating"]
+        user = update.effective_user
+        username = f"@{user.username}" if user.username else None
+        reviews.append({
+            "id": len(reviews)+1,
+            "user_id": user.id,
+            "username": username,
+            "rating": rating,
+            "text": text,
+            "date": str(datetime.now()),
+            "deleted": False
+        })
+        save_reviews()
+        await context.bot.send_message(CHANNEL_REVIEWS, f"⭐ НОВЫЙ ОТЗЫВ\n\nОценка: {'⭐'*rating}\nОт: {username}\n\n{text}")
+        await update.message.reply_text("✅ Спасибо за отзыв!")
+        context.user_data.clear()
+
+# Админ
+async def admin_panel(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Статистика", callback_data="stats"),
+        InlineKeyboardButton("Рассылка", callback_data="broadcast"),
+    ]])
+    await update.message.reply_text("Админ панель:", reply_markup=buttons)
+
+async def admin_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "stats":
+        active = [r for r in reviews if not r.get("deleted", False)]
+        text = f"Отзывов: {len(active)}\nРейтинг: {sum(r['rating'] for r in active)/len(active):.1f}" if active else "Нет отзывов"
+        await query.edit_message_text(text)
+    elif query.data == "broadcast":
+        context.user_data["broadcast_mode"] = True
+        await query.edit_message_text("Введи текст рассылки:")
+
+async def broadcast_msg(update, context):
+    if context.user_data.get("broadcast_mode") and update.effective_user.id == ADMIN_ID:
+        users = set(r["user_id"] for r in reviews)
+        ok = 0
+        for uid in users:
+            try:
+                await context.bot.send_message(uid, f"📢 РАССЫЛКА\n\n{update.message.text}")
+                ok += 1
+            except:
+                pass
+        await update.message.reply_text(f"Отправлено: {ok}")
+        context.user_data.pop("broadcast_mode", None)
+
+async def handle_buttons(update, context):
+    text = update.message.text
+    if text == "🎨 Примеры":
+        await examples(update, context)
+    elif text == "⭐ Отзыв":
+        await review_start(update, context)
+    elif text == "📊 Профиль":
+        await profile(update, context)
+    elif text == "📢 Канал":
+        await channel(update, context)
+    elif text == "❓ FAQ":
+        await faq(update, context)
+    elif text == "🔐 Админ":
+        await admin_panel(update, context)
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("delete", delete_review))
+    app.add_handler(CallbackQueryHandler(rating_callback, pattern="^r[1-5]$"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(stats|broadcast)$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, review_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_msg))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
+    print("✅ Бот запущен")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
